@@ -42,9 +42,7 @@ impl AppState {
         let _ = self.tx.send(SsePush { table_html, log_html });
     }
 
-    fn push_one(&self, ev: crate::events::WgEvent) {
-        self.push(vec![ev]);
-    }
+
 }
 
 // Form types
@@ -96,8 +94,8 @@ async fn sse_events(State(s): State<AppState>) -> impl axum::response::IntoRespo
 }
 
 async fn action_send(State(s): State<AppState>, Form(f): Form<PeerKeyForm>) {
-    let ev = s.iface.lock().unwrap().simulate_send(&f.peer_key);
-    s.push_one(ev);
+    let evs = s.iface.lock().unwrap().simulate_send(&f.peer_key);
+    s.push(evs);
 }
 
 async fn action_recv(State(s): State<AppState>, Form(f): Form<PeerKeyForm>) {
@@ -131,6 +129,7 @@ async fn main() {
     let mut iface = Interface::new(
         "wg0",
         PrivateKey::new("server-private-key"),
+        PublicKey::new("server-public-key"),
         51820,
         "10.0.0.1/24".parse().unwrap(),
     );

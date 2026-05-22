@@ -8,11 +8,28 @@ pub fn table_html(iface: &Interface) -> String {
         let ips = peer.allowed_ips.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(", ");
         let ep = peer.endpoint.map(|e| e.to_string()).unwrap_or_else(|| "(none)".to_string());
         let key = &peer.public_key.0;
+
+        let (session_cell, nonce_cell) = match &peer.session_key {
+            Some(sk) => {
+                let truncated = format!("{}…", &sk[..16]);
+                (
+                    format!("<td class='session' title='{sk}'>{truncated}</td>"),
+                    format!("<td class='nonce'>{}</td>", peer.send_nonce),
+                )
+            }
+            None => (
+                "<td class='session none'>—</td>".to_string(),
+                "<td class='nonce none'>—</td>".to_string(),
+            ),
+        };
+
         format!(
             "<tr>\
               <td class='key'>{key}</td>\
               <td class='ip'>{ips}</td>\
               <td class='ep'>{ep}</td>\
+              {session_cell}\
+              {nonce_cell}\
               <td class='row-actions'>\
                 <form action='/action/send' method='post' data-ajax>\
                   <input type='hidden' name='peer_key' value='{key}'>\
@@ -37,6 +54,8 @@ pub fn table_html(iface: &Interface) -> String {
             <th>Public Key</th>\
             <th>Allowed IPs</th>\
             <th>Endpoint (outer)</th>\
+            <th>Session Key</th>\
+            <th>Nonce</th>\
             <th></th>\
           </tr></thead>\
           <tbody>{rows}</tbody>\
@@ -46,8 +65,15 @@ pub fn table_html(iface: &Interface) -> String {
 
 pub fn log_entry_html(ev: &WgEvent) -> String {
     match ev {
-        WgEvent::Sent { inner_dst, peer, outer_dst } =>
-            format!("<div class='log send'>→ SEND  inner={inner_dst}  peer={}  outer={outer_dst}</div>", peer.0),
+        WgEvent::HandshakeCompleted { peer, session_key } => {
+            let truncated = format!("{}…", &session_key[..16]);
+            format!(
+                "<div class='log handshake'>⚡ HANDSHAKE  peer={}  session={truncated}</div>",
+                peer.0
+            )
+        }
+        WgEvent::Sent { inner_dst, peer, outer_dst, nonce } =>
+            format!("<div class='log send'>→ SEND  inner={inner_dst}  peer={}  outer={outer_dst}  nonce={nonce}</div>", peer.0),
         WgEvent::NoRoute { inner_dst } =>
             format!("<div class='log drop'>✗ DROP  inner={inner_dst}  (no route)</div>"),
         WgEvent::NoEndpoint { inner_dst, peer } =>
@@ -69,7 +95,7 @@ fn base_styles() -> &'static str {
     r#"
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     html { background: #070b10; min-height: 100%; }
-    body { font-family: monospace; background: #0d1117; color: #c9d1d9; padding: 2rem; max-width: 960px; margin: 0 auto; min-height: 100vh; }
+    body { font-family: monospace; background: #0d1117; color: #c9d1d9; padding: 2rem; max-width: 1100px; margin: 0 auto; min-height: 100vh; }
     header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 2rem; }
     h1 { color: #58a6ff; font-size: 1.4rem; margin-bottom: .25rem; }
     .meta { color: #8b949e; font-size: .85rem; }
@@ -85,6 +111,7 @@ pub fn full_page(iface: &Interface) -> String {
     let name = &iface.name;
     let addr = &iface.address;
     let port = iface.listen_port;
+    let pubkey = &iface.public_key.0;
     let base = base_styles();
 
     format!(r#"<!DOCTYPE html>
@@ -101,9 +128,14 @@ pub fn full_page(iface: &Interface) -> String {
     table {{ width: 100%; border-collapse: collapse; font-size: .9rem; }}
     th {{ text-align: left; color: #8b949e; font-weight: normal; padding: .4rem .75rem .4rem 0; font-size: .75rem; text-transform: uppercase; }}
     td {{ padding: .5rem .75rem .5rem 0; border-top: 1px solid #21262d; vertical-align: middle; }}
-    .key  {{ color: #d2a8ff; }}
-    .ip   {{ color: #7ee787; }}
-    .ep   {{ color: #ffa657; }}
+    .key     {{ color: #d2a8ff; }}
+    .ip      {{ color: #7ee787; }}
+    .ep      {{ color: #ffa657; }}
+    .session {{ color: #79c0ff; font-size: .8rem; cursor: default; }}
+    .session.none {{ color: #484f58; }}
+    .nonce   {{ color: #e3b341; }}
+    .nonce.none {{ color: #484f58; }}
+    .iface-pubkey {{ color: #d2a8ff; }}
     .row-actions {{ display: flex; gap: .4rem; }}
     button {{ background: #21262d; color: #c9d1d9; border: 1px solid #30363d;
               padding: .2rem .6rem; cursor: pointer; font-family: monospace; font-size: .8rem; }}
@@ -116,10 +148,11 @@ pub fn full_page(iface: &Interface) -> String {
     .add-form input[name=endpoint]    {{ width: 14rem; }}
     #event-log {{ max-height: 280px; overflow-y: auto; font-size: .85rem; }}
     .log {{ padding: .3rem 0; border-bottom: 1px solid #21262d; }}
-    .log.send {{ color: #58a6ff; }}
-    .log.recv {{ color: #7ee787; }}
-    .log.drop {{ color: #f85149; }}
-    .log.roam {{ color: #ffa657; }}
+    .log.send      {{ color: #58a6ff; }}
+    .log.recv      {{ color: #7ee787; }}
+    .log.drop      {{ color: #f85149; }}
+    .log.roam      {{ color: #ffa657; }}
+    .log.handshake {{ color: #e3b341; }}
     .log-empty {{ color: #8b949e; font-style: italic; }}
   </style>
 </head>
@@ -128,6 +161,7 @@ pub fn full_page(iface: &Interface) -> String {
     <div>
       <h1>{name}</h1>
       <p class="meta">addr: {addr} &nbsp;·&nbsp; port: {port}</p>
+      <p class="meta">pubkey: <span class="iface-pubkey">{pubkey}</span></p>
     </div>
     <nav><a href="/about">What's this all about, then? →</a></nav>
   </header>
@@ -204,6 +238,7 @@ pub fn about_page() -> &'static str {
     a:hover { text-decoration: underline; }
     nav a:hover { text-decoration: none; }
     .section-ref { color: #8b949e; font-size: .8rem; }
+    sup { font-size: .75em; }
   </style>
 </head>
 <body>
@@ -244,6 +279,57 @@ pub fn about_page() -> &'static str {
       Section 3 covers the send/receive flows in detail.</p>
     </div>
 
+    <h2>Your interface's own identity: a Curve25519 keypair</h2>
+    <p>
+      It's not just peers that have keys — the WireGuard interface itself (<code>wg0</code>) has
+      its own static Curve25519 <strong>public/private keypair</strong>. The public key shown in
+      the header is how this interface proves its identity to peers during the handshake. Each
+      peer must know this public key in advance and configure it as the counterpart they expect
+      to talk to; only the holder of the matching private key can respond correctly.
+    </p>
+    <p>
+      The private key never leaves the device and is never transmitted. In
+      <code>wg show wg0</code> output you only see the public key — a 32-byte Curve25519 point
+      encoded in base64. This asymmetry (peers exchange public keys out of band; private keys stay
+      local) is what gives WireGuard its authentication guarantee without any PKI or certificate
+      authority.
+    </p>
+
+    <h2>The Noise handshake and the session key</h2>
+    <p>
+      Before any data packets flow, WireGuard runs a two-message handshake defined by the
+      <strong>Noise_IKpsk2</strong> protocol pattern. Each party uses its static Curve25519 keypair
+      and the peer's known public key to perform a series of Diffie-Hellman exchanges. The results
+      are mixed with an optional pre-shared symmetric key (the "psk2" in the name) through BLAKE2s
+      into a shared secret, from which a pair of symmetric <strong>session keys</strong> are derived
+      — one for each direction of traffic.
+    </p>
+    <p>
+      The "Session Key" column in the routing table shows the current symmetric key for each peer.
+      It reads <strong>—</strong> until you hit Send or Recv for the first time, at which point a
+      <strong>⚡ HANDSHAKE</strong> event appears in the log and the column fills in with the
+      (simulated) 256-bit key. In real WireGuard, session keys are rotated every 3 minutes or
+      2<sup>60</sup> packets, whichever comes first, by silently running a new handshake in the
+      background.
+    </p>
+
+    <h2>ChaCha20-Poly1305 and the nonce</h2>
+    <p>
+      Data packets are encrypted with <strong>ChaCha20-Poly1305</strong>, an authenticated
+      encryption with associated data (AEAD) cipher. It simultaneously encrypts the payload and
+      produces a 128-bit authentication tag — so a single decryption step both decrypts and
+      verifies integrity. Any tampering with the ciphertext causes decryption to fail outright.
+    </p>
+    <p>
+      The cipher requires a <strong>nonce</strong> — a 64-bit counter that must never repeat under
+      the same session key. WireGuard uses a simple incrementing counter starting at zero,
+      incremented for every packet sent to a given peer. The nonce travels in the packet header so
+      the receiver can decrypt; because it is also part of the authenticated data, replaying a
+      captured packet with a previously-seen nonce is rejected. The <strong>Nonce</strong> column
+      in the demo shows the current outbound counter for each peer — watch it increment each time
+      you hit <strong>Send</strong>.
+    </p>
+
     <h2>The routing table: what the demo shows</h2>
     <p>
       In the demo, <code>wg0</code> is a WireGuard interface with an inner address of
@@ -252,7 +338,9 @@ pub fn about_page() -> &'static str {
     </p>
     <p>
       &nbsp;&nbsp;<code>allowed_ips</code> — the inner IP addresses this peer is permitted to use.<br>
-      &nbsp;&nbsp;<code>endpoint</code> — the real outer <code>IP:port</code> where packets for this peer are sent.
+      &nbsp;&nbsp;<code>endpoint</code> — the real outer <code>IP:port</code> where packets for this peer are sent.<br>
+      &nbsp;&nbsp;<code>session key</code> — the symmetric key derived from the Noise handshake with this peer.<br>
+      &nbsp;&nbsp;<code>nonce</code> — the outbound ChaCha20-Poly1305 counter for this peer.
     </p>
     <p>
       The <code>allowed_ips</code> field serves double duty: it is used <em>outbound</em>
@@ -265,9 +353,10 @@ pub fn about_page() -> &'static str {
     <p>
       When <code>wg0</code> needs to send a packet to an inner destination (say <code>10.0.0.2</code>),
       it walks the cryptokey routing table looking for a peer whose <code>allowed_ips</code>
-      contains that address. Once found, it encrypts the entire IP packet using that peer's
-      public key (via the Noise handshake session), wraps it in a new UDP packet addressed
-      to the peer's outer <code>endpoint</code>, and sends it on its way.
+      contains that address. Once found, if no session exists yet, it runs the Noise handshake to
+      derive a session key. Then it encrypts the entire IP packet using ChaCha20-Poly1305 with that
+      session key and the current nonce, increments the nonce, wraps it in a new UDP packet
+      addressed to the peer's outer <code>endpoint</code>, and sends it on its way.
     </p>
     <p>
       The inner packet — source address, destination address, payload — becomes completely
@@ -279,9 +368,10 @@ pub fn about_page() -> &'static str {
     <p>
       When a UDP packet arrives at <code>wg0</code>'s listen port, WireGuard identifies
       which peer's session key can decrypt it (the handshake establishes this association).
-      After decryption, the inner source IP is revealed. WireGuard then checks: is this IP
-      in that peer's <code>allowed_ips</code>? If not, the packet is silently dropped —
-      even though it decrypted correctly. A peer can't claim an IP it wasn't configured for.
+      After decryption and authentication-tag verification, the inner source IP is revealed.
+      WireGuard then checks: is this IP in that peer's <code>allowed_ips</code>? If not, the
+      packet is silently dropped — even though it decrypted correctly. A peer can't claim an IP
+      it wasn't configured for.
     </p>
     <p>
       This is the security guarantee: cryptographic identity and routing policy are unified.

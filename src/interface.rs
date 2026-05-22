@@ -5,10 +5,12 @@ use crate::types::{PrivateKey, PublicKey};
 
 pub struct Peer {
     pub public_key: PublicKey,
-    /// Inner IP ranges this peer is allowed to use as a source (CIDR).
     pub allowed_ips: Vec<Ipv4Network>,
-    /// Real outer UDP endpoint. None until we hear from the peer.
     pub endpoint: Option<SocketAddr>,
+    /// Symmetric session key derived from the Noise_IKpsk2 handshake. None until first use.
+    pub session_key: Option<String>,
+    /// Outbound ChaCha20-Poly1305 nonce counter. Incremented on every sent packet.
+    pub send_nonce: u64,
 }
 
 impl Peer {
@@ -24,14 +26,35 @@ impl Peer {
 pub struct Interface {
     pub name: String,
     pub private_key: PrivateKey,
+    pub public_key: PublicKey,
     pub listen_port: u16,
     pub address: Ipv4Network,
     pub peers: Vec<Peer>,
 }
 
+/// Produce a deterministic-looking 32-byte hex session key for the demo.
+/// XORs bytes from both key labels with a position-dependent constant.
+fn fake_session_key(peer_key: &str, iface_key: &str) -> String {
+    let pb = peer_key.as_bytes();
+    let ib = iface_key.as_bytes();
+    (0u8..32)
+        .map(|i| {
+            let p = pb[usize::from(i) % pb.len().max(1)];
+            let k = ib[usize::from(i) % ib.len().max(1)];
+            format!("{:02x}", p ^ k ^ i.wrapping_mul(37))
+        })
+        .collect()
+}
+
 impl Interface {
-    pub fn new(name: &str, private_key: PrivateKey, listen_port: u16, address: Ipv4Network) -> Self {
-        Self { name: name.to_string(), private_key, listen_port, address, peers: Vec::new() }
+    pub fn new(
+        name: &str,
+        private_key: PrivateKey,
+        public_key: PublicKey,
+        listen_port: u16,
+        address: Ipv4Network,
+    ) -> Self {
+        Self { name: name.to_string(), private_key, public_key, listen_port, address, peers: Vec::new() }
     }
 
     pub fn add_peer(
@@ -40,21 +63,49 @@ impl Interface {
         allowed_ips: Vec<Ipv4Network>,
         endpoint: Option<SocketAddr>,
     ) {
-        self.peers.push(Peer { public_key, allowed_ips, endpoint });
+        self.peers.push(Peer {
+            public_key,
+            allowed_ips,
+            endpoint,
+            session_key: None,
+            send_nonce: 0,
+        });
     }
 
-    /// Outbound: find the peer whose allowed_ips covers `dst`, encrypt (stub), send to endpoint.
-    pub fn send(&self, dst: IpAddr, _payload: &[u8]) -> WgEvent {
-        match self.route_outbound(dst) {
-            Some(peer) => match peer.endpoint {
-                Some(ep) => WgEvent::Sent { inner_dst: dst, peer: peer.public_key.clone(), outer_dst: ep },
-                None => WgEvent::NoEndpoint { inner_dst: dst, peer: peer.public_key.clone() },
-            },
-            None => WgEvent::NoRoute { inner_dst: dst },
+    /// Outbound: find peer by allowed_ips, run handshake if needed, encrypt (stub), send.
+    pub fn send(&mut self, dst: IpAddr, _payload: &[u8]) -> Vec<WgEvent> {
+        let Some(idx) = self.peers.iter().position(|p| p.allows(dst)) else {
+            return vec![WgEvent::NoRoute { inner_dst: dst }];
+        };
+
+        let Some(ep) = self.peers[idx].endpoint else {
+            return vec![WgEvent::NoEndpoint { inner_dst: dst, peer: self.peers[idx].public_key.clone() }];
+        };
+
+        let mut events = Vec::new();
+
+        if self.peers[idx].session_key.is_none() {
+            let sk = fake_session_key(&self.peers[idx].public_key.0, &self.private_key.0);
+            self.peers[idx].session_key = Some(sk.clone());
+            events.push(WgEvent::HandshakeCompleted {
+                peer: self.peers[idx].public_key.clone(),
+                session_key: sk,
+            });
         }
+
+        let nonce = self.peers[idx].send_nonce;
+        self.peers[idx].send_nonce += 1;
+
+        events.push(WgEvent::Sent {
+            inner_dst: dst,
+            peer: self.peers[idx].public_key.clone(),
+            outer_dst: ep,
+            nonce,
+        });
+        events
     }
 
-    /// Inbound: decrypt (stub), check allowed_ips, update endpoint on roam.
+    /// Inbound: decrypt (stub), run handshake if needed, check allowed_ips, update endpoint on roam.
     pub fn recv(
         &mut self,
         outer_src: SocketAddr,
@@ -65,7 +116,6 @@ impl Interface {
         let mut events = Vec::new();
 
         let Some(idx) = self.peers.iter().position(|p| &p.public_key == from_key) else {
-            // Unknown key — in a real implementation this would be silently dropped.
             return events;
         };
 
@@ -79,7 +129,15 @@ impl Interface {
             return events;
         }
 
-        // Roaming: valid packet from a new outer address → update endpoint silently.
+        if self.peers[idx].session_key.is_none() {
+            let sk = fake_session_key(&from_key.0, &self.private_key.0);
+            self.peers[idx].session_key = Some(sk.clone());
+            events.push(WgEvent::HandshakeCompleted {
+                peer: from_key.clone(),
+                session_key: sk,
+            });
+        }
+
         let prev = self.peers[idx].endpoint;
         if prev != Some(outer_src) {
             events.push(WgEvent::Roamed {
@@ -100,18 +158,16 @@ impl Interface {
 
     // --- Helpers used by the web server to simulate actions ---
 
-    /// Send a test packet to the given peer (looked up by key label).
-    pub fn simulate_send(&self, peer_key: &str) -> WgEvent {
-        match self.peers.iter().find(|p| p.public_key.0 == peer_key) {
-            Some(peer) => match peer.first_ip() {
-                Some(ip) => self.send(ip, b"ping"),
-                None => WgEvent::NoRoute { inner_dst: "0.0.0.0".parse().unwrap() },
-            },
-            None => WgEvent::NoRoute { inner_dst: "0.0.0.0".parse().unwrap() },
+    pub fn simulate_send(&mut self, peer_key: &str) -> Vec<WgEvent> {
+        let ip = self.peers.iter()
+            .find(|p| p.public_key.0 == peer_key)
+            .and_then(|p| p.first_ip());
+        match ip {
+            Some(ip) => self.send(ip, b"ping"),
+            None => vec![WgEvent::NoRoute { inner_dst: "0.0.0.0".parse().unwrap() }],
         }
     }
 
-    /// Simulate receiving a packet from a peer (using their known endpoint as outer src).
     pub fn simulate_recv(&mut self, peer_key: &str) -> Vec<WgEvent> {
         let Some(idx) = self.peers.iter().position(|p| p.public_key.0 == peer_key) else {
             return vec![];
@@ -127,12 +183,10 @@ impl Interface {
         self.recv(outer_src, &key, inner_src, b"pong")
     }
 
-    /// Simulate a peer roaming to a new outer IP (derived from a simple counter).
     pub fn simulate_roam(&mut self, peer_key: &str, roam_counter: u8) -> Vec<WgEvent> {
         let Some(idx) = self.peers.iter().position(|p| p.public_key.0 == peer_key) else {
             return vec![];
         };
-        // Generate a new outer IP that differs from the current one.
         let new_outer: SocketAddr = format!("198.18.0.{}:51820", roam_counter).parse().unwrap();
         let inner_src = match self.peers[idx].first_ip() {
             Some(ip) => ip,
@@ -140,9 +194,5 @@ impl Interface {
         };
         let key = self.peers[idx].public_key.clone();
         self.recv(new_outer, &key, inner_src, b"roaming")
-    }
-
-    fn route_outbound(&self, dst: IpAddr) -> Option<&Peer> {
-        self.peers.iter().find(|p| p.allows(dst))
     }
 }

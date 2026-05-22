@@ -3,10 +3,15 @@ use crate::types::PublicKey;
 
 #[derive(Debug, Clone)]
 pub enum WgEvent {
+    HandshakeCompleted {
+        peer: PublicKey,
+        session_key: String,
+    },
     Sent {
         inner_dst: IpAddr,
         peer: PublicKey,
         outer_dst: SocketAddr,
+        nonce: u64,
     },
     NoRoute {
         inner_dst: IpAddr,
