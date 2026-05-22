@@ -1,0 +1,20 @@
+service: wireguard_viz
+image: nickagliano/wireguard_viz
+
+servers:
+  web:
+    - 178.156.215.141
+
+proxy:
+  app_port: 3000
+  ssl: true
+  host: wireguard.epm.dev
+
+registry:
+  server: ghcr.io
+  username: nickagliano
+  password:
+    - KAMAL_REGISTRY_PASSWORD
+
+builder:
+  arch: amd64
