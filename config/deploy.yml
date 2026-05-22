@@ -9,6 +9,8 @@ proxy:
   app_port: 3000
   ssl: true
   host: wireguard.epm.dev
+  healthcheck:
+    path: /
 
 registry:
   server: ghcr.io
