@@ -118,7 +118,7 @@ pub fn full_page(iface: &Interface) -> String {
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>WireGuard Viz — {name}</title>
+  <title>WireGuard Visualization Demo</title>
   <style>
     {base}
     section {{ margin-bottom: 2rem; }}
